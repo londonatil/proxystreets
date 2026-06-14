@@ -1,0 +1,32 @@
+# Render Blueprint for the Smarty address proxy.
+#
+# Secrets (the Smarty key) are marked `sync: false`, which means their values are
+# NOT stored in this file or the repo. On first deploy Render prompts you to type
+# them into the dashboard, where they live only as encrypted environment variables.
+services:
+  - type: web
+    name: smarty-address-proxy
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      # --- secrets: entered in the Render dashboard, never committed ---
+      - key: API_US_KEY
+        sync: false
+      - key: API_US_REFERER
+        sync: false
+      # - key: API_US_KEY1        # optional extra keys for rotation
+      #   sync: false
+      # - key: API_US_REFERER1
+      #   sync: false
+      - key: API_INTL_KEY        # international Smarty key
+        sync: false
+      - key: API_INTL_REFERER
+        sync: false
+
+      # --- non-secret config: safe to keep here ---
+      - key: ALLOWED_ORIGINS
+        value: https://rubnrestore.com,https://www.rubnrestore.com
+      - key: CACHE_TTL
+        value: "60"
