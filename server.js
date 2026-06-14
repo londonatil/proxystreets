@@ -41,7 +41,7 @@ if (!usProfiles && !intlProfiles) {
   process.exit(1);
 }
 
-console.log("✅ Credentials loaded successfully! US:", Boolean(usProfiles), "Intl:", Boolean(intlProfiles));
+console.log("✅ Credentials loaded successfully!");
 
 const ENDPOINTS = {
   us: { base: "https://us-autocomplete-pro.api.smarty.com/lookup", allowed: new Set(["search","selected","max_results","source","include_only_cities","include_only_states","include_only_zip_codes","exclude_states","prefer_cities","prefer_states","prefer_zip_codes","prefer_ratio","prefer_geolocation"]), required: ["search"] },
