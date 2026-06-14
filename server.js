@@ -2,6 +2,12 @@ import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
 
+console.log("=== ENVIRONMENT DEBUG ===");
+console.log("API_US_KEY exists:", !!process.env.API_US_KEY);
+console.log("API_US_REFERER exists:", !!process.env.API_US_REFERER);
+console.log("API_INTL_KEY exists:", !!process.env.API_INTL_KEY);
+console.log("=========================");
+
 const { PORT = 3000, ALLOWED_ORIGINS = "", CACHE_TTL = "60" } = process.env;
 
 function loadProfiles(prefix) {
@@ -159,12 +165,10 @@ async function handleLookup(region, req, res, addressId) {
       } else {
         profile.fails++;
         profile.skip = Math.pow(2, profile.fails - 1);
-        console.error(`API failed with key ${profile.key.substring(0,8)}... (fails: ${profile.fails})`);
       }
     } catch (err) {
       profile.fails++;
       profile.skip = Math.pow(2, profile.fails - 1);
-      console.error(`Upstream failed (${region}):`, err);
     }
 
     attempts++;
