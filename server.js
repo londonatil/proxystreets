@@ -21,16 +21,29 @@ function loadProfiles(prefix) {
   return profiles.length ? profiles : null;
 }
 
-const usProfiles = loadProfiles("API_US");
-const intlProfiles = loadProfiles("API_INTL");
-if (!usProfiles && !intlProfiles) {
-  console.error("No credentials configured. Set API_US_KEY + API_US_REFERER (or numbered: API_US_KEY1 + API_US_REFERER1, API_US_KEY2...) and/or the API_INTL equivalents.");
+// Four credential pools. Verification pools are optional -- if API_US_VERIFY_* /
+// API_INTL_VERIFY_* aren't set, /verify falls back to the autocomplete keys
+// (shared profile objects, so failure backoff is shared too).
+const pools = {
+  us: loadProfiles("API_US"),
+  intl: loadProfiles("API_INTL"),
+  us_verify: loadProfiles("API_US_VERIFY"),
+  intl_verify: loadProfiles("API_INTL_VERIFY")
+};
+if (!pools.us_verify) pools.us_verify = pools.us;
+if (!pools.intl_verify) pools.intl_verify = pools.intl;
+if (Object.values(pools).every(p => !p)) {
+  console.error("No credentials configured. Set API_US_KEY + API_US_REFERER (or numbered: API_US_KEY1 + API_US_REFERER1, API_US_KEY2...) and/or the API_INTL equivalents. Optional dedicated verification pools: API_US_VERIFY_KEY + API_US_VERIFY_REFERER, API_INTL_VERIFY_KEY + API_INTL_VERIFY_REFERER.");
   process.exit(1);
 }
 
+// "profiles" says which credential pool the endpoint uses; "iso3" marks
+// endpoints whose country param must be converted to uppercase ISO-3.
 const ENDPOINTS = {
-  us: { base: "https://us-autocomplete-pro.api.smarty.com/lookup", allowed: new Set(["search","selected","max_results","source","include_only_cities","include_only_states","include_only_zip_codes","exclude_states","prefer_cities","prefer_states","prefer_zip_codes","prefer_ratio","prefer_geolocation"]), required: ["search"] },
-  intl: { base: "https://international-autocomplete.api.smarty.com/v2/lookup", allowed: new Set(["search","country","max_results","include_only_locality","include_only_administrative_area","include_only_postal_code","geolocation"]), required: ["country"] }
+  us: { base: "https://us-autocomplete-pro.api.smarty.com/lookup", allowed: new Set(["search","selected","max_results","source","include_only_cities","include_only_states","include_only_zip_codes","exclude_states","prefer_cities","prefer_states","prefer_zip_codes","prefer_ratio","prefer_geolocation"]), required: ["search"], profiles: "us" },
+  intl: { base: "https://international-autocomplete.api.smarty.com/v2/lookup", allowed: new Set(["search","country","max_results","include_only_locality","include_only_administrative_area","include_only_postal_code","geolocation"]), required: ["country"], profiles: "intl", iso3: true },
+  us_verify: { base: "https://us-street.api.smarty.com/street-address", allowed: new Set(["street","street2","secondary","city","state","zipcode","lastline","addressee","urbanization","candidates","match","format"]), required: ["street"], profiles: "us_verify" },
+  intl_verify: { base: "https://international-street.api.smarty.com/verify", allowed: new Set(["country","address1","address2","address3","address4","organization","locality","administrative_area","postal_code","freeform","geocode","language","input_id"]), required: ["country"], profiles: "intl_verify", iso3: true }
 };
 
 const US_ALIASES = new Set(["US","USA","U.S.","U.S.A.","UNITED STATES","UNITED STATES OF AMERICA"]);
@@ -101,27 +114,20 @@ function levenshtein(a, b) {
   return 99;
 }
 
-let usIndex = 0;
-function getNextUsProfile() {
-  if (!usProfiles) return null;
-  for (let attempts = 0; attempts < usProfiles.length; attempts++) {
-    const p = usProfiles[usIndex];
-    usIndex = (usIndex + 1) % usProfiles.length;
+// Round-robin per pool. Each pool keeps its own rotation index; when a verify
+// pool falls back to the autocomplete pool the profile objects are shared, so
+// a key penalised on /lookup is also skipped on /verify (and vice versa).
+const poolIndex = { us: 0, intl: 0, us_verify: 0, intl_verify: 0 };
+function getNextProfile(group) {
+  const list = pools[group];
+  if (!list) return null;
+  for (let attempts = 0; attempts < list.length; attempts++) {
+    const p = list[poolIndex[group]];
+    poolIndex[group] = (poolIndex[group] + 1) % list.length;
     if (p.skip <= 0) return p;
     p.skip--;
   }
-  return usProfiles[0];
-}
-let intlIndex = 0;
-function getNextIntlProfile() {
-  if (!intlProfiles) return null;
-  for (let attempts = 0; attempts < intlProfiles.length; attempts++) {
-    const p = intlProfiles[intlIndex];
-    intlIndex = (intlIndex + 1) % intlProfiles.length;
-    if (p.skip <= 0) return p;
-    p.skip--;
-  }
-  return intlProfiles[0];
+  return list[0];
 }
 
 // Only these upstream statuses mean "this key is the problem, try another one".
@@ -131,12 +137,12 @@ function shouldRotate(status) {
 }
 
 function buildUpstream(region, addressId, query, profile) {
-  const { base, allowed } = ENDPOINTS[region];
+  const { base, allowed, iso3 } = ENDPOINTS[region];
   const params = new URLSearchParams();
   for (const [k, v] of Object.entries(query)) {
     if (!allowed.has(k) || v === undefined || v === "") continue;
     // Smarty International requires uppercase ISO-3 country codes (WC sends ISO-2).
-    params.set(k, (region === "intl" && k === "country") ? toISO3(v) : v);
+    params.set(k, (iso3 && k === "country") ? toISO3(v) : v);
   }
   // Cache key is derived from the (sorted) request params only -- NOT the API
   // key -- so a result fetched with one key is reused regardless of which key
@@ -151,14 +157,14 @@ function buildUpstream(region, addressId, query, profile) {
 async function handleLookup(region, req, res, addressId) {
   // Validate BEFORE selecting a profile, so an invalid request doesn't churn
   // the round-robin index / backoff counters.
-  const { required } = ENDPOINTS[region];
+  const { required, profiles: group } = ENDPOINTS[region];
   for (const param of required) {
     if (!req.query[param]) return res.status(400).json({ error: `Missing ${param}` });
   }
-  if (!addressId && !req.query.search) return res.status(400).json({ error: "Missing search" });
+  if (region === "intl" && !addressId && !req.query.search) return res.status(400).json({ error: "Missing search" });
+  if (region === "intl_verify" && !req.query.address1 && !req.query.freeform) return res.status(400).json({ error: "Missing address1 or freeform" });
 
-  const getNextProfile = region === "us" ? getNextUsProfile : getNextIntlProfile;
-  const profilesList = region === "us" ? usProfiles : intlProfiles;
+  const profilesList = pools[group];
   if (!profilesList) return res.status(503).json({ error: `No credentials for "${region}"` });
 
   const clientKey = `${region}:${req.ip || "unknown"}`;
@@ -166,7 +172,7 @@ async function handleLookup(region, req, res, addressId) {
   const prev = sticky.get(clientKey);
   let profile = (prev && search && levenshtein(search, prev.search) <= 1)
     ? prev.profile
-    : getNextProfile();
+    : getNextProfile(group);
   if (!profile) return res.status(503).json({ error: `No credentials for "${region}"` });
 
   let attempts = 0;
@@ -217,7 +223,7 @@ async function handleLookup(region, req, res, addressId) {
       console.error(`Upstream failed (${region}):`, err);
     }
     attempts++;
-    profile = getNextProfile();
+    profile = getNextProfile(group);
     if (!profile) break;
   }
   return res.status(502).json({ error: "All API keys failed" });
@@ -235,9 +241,29 @@ app.get("/lookup/:addressId", (req, res) => {
   if (!country) return res.status(400).json({ error: "Missing country" });
   return handleLookup(resolveRegion(country), req, res, req.params.addressId);
 });
-app.get("/health", (_req, res) => res.json({ ok: true, us: Boolean(usProfiles), intl: Boolean(intlProfiles) }));
+// Address verification: routes to Smarty US Street (street/city/state/zipcode
+// params) or International Street (address1|freeform, locality, postal_code...)
+// based on country. Same key rotation, cache, and rate limiting as /lookup.
+app.get("/verify", (req, res) => {
+  const country = (req.query.country || "").trim();
+  if (!country) return res.status(400).json({ error: "Missing country" });
+  const kind = resolveRegion(country) === "us" ? "us_verify" : "intl_verify";
+  return handleLookup(kind, req, res, null);
+});
+app.get("/health", (_req, res) => res.json({
+  ok: true,
+  us: Boolean(pools.us),
+  intl: Boolean(pools.intl),
+  us_verify: Boolean(pools.us_verify),
+  intl_verify: Boolean(pools.intl_verify),
+  // "dedicated" = verify has its own keys (not falling back to autocomplete's)
+  us_verify_dedicated: Boolean(pools.us_verify && pools.us_verify !== pools.us),
+  intl_verify_dedicated: Boolean(pools.intl_verify && pools.intl_verify !== pools.intl)
+}));
 app.listen(PORT, () => {
   console.log(`API proxy on :${PORT}`);
-  console.log(`  US:  ${usProfiles ? "ready" : "off"}`);
-  console.log(`  Intl:${intlProfiles ? "ready" : "off"}`);
+  console.log(`  US autocomplete:   ${pools.us ? "ready" : "off"}`);
+  console.log(`  Intl autocomplete: ${pools.intl ? "ready" : "off"}`);
+  console.log(`  US verify:         ${pools.us_verify ? (pools.us_verify === pools.us ? "ready (shared keys)" : "ready (dedicated keys)") : "off"}`);
+  console.log(`  Intl verify:       ${pools.intl_verify ? (pools.intl_verify === pools.intl ? "ready (shared keys)" : "ready (dedicated keys)") : "off"}`);
 });
